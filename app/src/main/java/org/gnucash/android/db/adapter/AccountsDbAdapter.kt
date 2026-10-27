@@ -118,51 +118,8 @@ class AccountsDbAdapter(
         if (account.isRoot && !account.isTemplate) {
             rootUID = account.uid
         }
-        
-        val savedAccount = super.addRecord(account, updateMethod)
-
-        // invalidate the cached balances for this account and all its ancestors
-        invalidateBalanceCache(account.uid)
-
-        return savedAccount
-    }
-
-    /**
-     * Overridden to handle bulk cache invalidation during imports (like XML backups).
-     * If the base DatabaseAdapter performs bulk insert without routing through addRecord,
-     * the cache must be invalidated to prevent stale balances post-import.
-     */
-    @Throws(SQLException::class)
-    override fun bulkAddRecords(records: List<Account>, updateMethod: UpdateMethod): Long {
-        val result = super.bulkAddRecords(records, updateMethod)
-        // bulk inserts bypass addRecord, so clear all cached balances to avoid stale values after imports
-        updateAllAccounts(AccountEntry.COLUMN_BALANCE, null)
-        return result
-    }
-
-    /**
-     * Invalidates the cached balance for an account and all its ancestors.
-     * Includes a loop guard against cyclic dependencies (corrupted DB).
-     */
-    private fun invalidateBalanceCache(accountUID: String) {
-        val uids = mutableListOf<String>()
-        var currentUid: String? = accountUID
-
-        // the database might be corrupted and contain cycles
-        while (currentUid != null && currentUid !in uids) {
-            uids.add(currentUid)
-            currentUid = getParentAccountUID(currentUid)
-        }
-
-        if (uids.isEmpty()) return
-
-        val contentValues = ContentValues().apply {
-            putNull(AccountEntry.COLUMN_BALANCE)
-            putNull(AccountEntry.COLUMN_CLEARED_BALANCE)
-            putNull(AccountEntry.COLUMN_NOCLOSING_BALANCE)
-            putNull(AccountEntry.COLUMN_RECONCILED_BALANCE)
-        }
-        db.update(tableName, contentValues, AccountEntry.COLUMN_UID + " IN " + uids.joinIn(), null)
+        //in-case the account already existed, we want to update the templates based on it as well
+        return super.addRecord(account, updateMethod)
     }
 
     @Throws(SQLException::class)
@@ -243,10 +200,6 @@ class AccountsDbAdapter(
      * @param newParentAccountUID GUID of the new parent account
      */
     fun reassignDescendantAccounts(parentAccountUID: String, newParentAccountUID: String) {
-        // invalidate both the old and the new parent chain caches before modifying
-        invalidateBalanceCache(parentAccountUID)
-        invalidateBalanceCache(newParentAccountUID)
-
         if (isCached) cache.clear()
         val descendantAccountUIDs = getDescendantAccountUIDs(parentAccountUID, null, null)
         if (descendantAccountUIDs.isEmpty()) return
@@ -312,9 +265,6 @@ class AccountsDbAdapter(
             // refuse to delete ROOT
             return false
         }
-
-        // invalidate the parent's cache before deleting this account
-        getParentAccountUID(accountUID)?.let { invalidateBalanceCache(it) }
 
         Timber.d("Delete account with rowId with its transactions and sub-accounts: %s", accountUID)
         if (isCached) cache.clear()
@@ -850,9 +800,8 @@ class AccountsDbAdapter(
                     continue
                 }
 
-                // add the child's balance if it has the same normal balance as the parent,
-                // subtract it if the types differ (e.g. expenses under an income parent
-                // contribute as profit)
+                // Parity Check: The child's contribution to the parent's balance is added
+                // if they share the same normal balance type and subtracted if they differ.
                 if (account.type.hasDebitNormalBalance == child.type.hasDebitNormalBalance) {
                     balance += childBalance * price
                 } else {
